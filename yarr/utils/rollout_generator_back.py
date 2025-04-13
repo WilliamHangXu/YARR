@@ -22,7 +22,7 @@ from yarr.agents.agent import ActResult
 
 class RolloutGenerator(object):
 
-    def __init__(self, env_device = 'cuda:0', method = 'base', save_dir=''):
+    def __init__(self, env_device = 'cuda:0'):
         self._env_device = env_device
 
     def _get_type(self, x):
