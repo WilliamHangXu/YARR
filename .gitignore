@@ -1,5 +1,6 @@
 __pycache__
 venv
+openai_api_keys.py
 .idea
 .bash_history
 .cache/
