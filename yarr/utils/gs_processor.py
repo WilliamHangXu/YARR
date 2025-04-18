@@ -14,64 +14,93 @@ import supervision as sv
 import pprint
 import shutil
 from yarr.utils.openai_api_keys import API_KEY_1, API_KEY_2
+from torch.cuda.amp import autocast
+
+def save_uri(img_uri, file_path):
+    # Convert the image string back to an image to check if chatgpt is fed the correct image
+    if img_uri.startswith("data:"):
+        header, image_data = img_uri.split(",", 1)
+    else:
+        image_data = img_uri
+
+    # Decode the base64 string to bytes
+    image_bytes = base64.b64decode(image_data)
+
+    # Save the image bytes to a file
+    with open(file_path, "wb") as f:
+        f.write(image_bytes)
+
+def reassign_labels(class_names):
+    """Create consistent integer labels for object types"""
+    labels = []
+    for i in class_names:
+        if i == "robot":
+            labels.append(1)
+        elif i == "mo":
+            labels.append(2)
+        elif i == "ro":
+            labels.append(3)
+        else:
+            labels.append(0)
+    return labels
+
 
 class GSProcessor:
-    def __init__(self, port=20107):
+    def __init__(self, device="cuda", model_name="chatgpt-4o-latest", log_dir=None):
         self.API_KEY = API_KEY_1
         self.client = openai.OpenAI(api_key=self.API_KEY)
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = torch.device(device)
+        # Make this GPU the current CUDA device so all .cuda() calls use the same one
+        torch.cuda.set_device(self.device)
+        self.model_name = model_name
+        self.log_dir = log_dir
         self.init_models()
         self._enable_mixed_precision()
         self.init = False
-        self.messages = []
-
+        self.prompt_messages = []
+        self.detect_messages = []
+        self.detect_num = 0
+        
     def init_models(self):
         print("Initializing models...")
         self.predictor = build_sam2_camera_predictor(
             "configs/sam2.1/sam2.1_hiera_l.yaml",
-            "/home/hangxu/Grounded-SAM-2/checkpoints/sam2.1_hiera_large.pt"
+            "/home/hangxu/Grounded-SAM-2/checkpoints/sam2.1_hiera_large.pt",
+            device=self.device
         )
+        
         model_id = "/home/hangxu/Grounded-SAM-2/groundingdino"
         self.processor = AutoProcessor.from_pretrained(model_id)
         self.grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(
             model_id
-        ).to("cuda")
+        ).to(self.device)
         print("Models initialized")
 
     def _enable_mixed_precision(self):
         """Configure mixed precision settings"""
-        torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
+        # torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
+        autocast_ctx = autocast()  
+        autocast_ctx.__enter__()
         if torch.cuda.get_device_properties(0).major >= 8:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
 
+    def reset(self, dir):
+        self.log_dir = dir
+        self.prompt_messages = []
+        self.detect_messages = []
+        self.detect_num = 0
+
     # Input: the first frame of observation and task description
     # Output: a list of objects, and a dictionary that categorizes these objects.
-    def get_detection_prompt(self, task_prompt, frame, model_name="gpt-4o"):
+    def get_detection_prompt(self, task_prompt, frame, detect_dir):
 
         
         img_uri = image_to_data_uri(frame, convert=True)
+        save_uri(img_uri, os.path.join(detect_dir, "get_detection_prompt.jpg"))
 
-        # Convert the image string back to an image to check if chatgpt is fed the correct image
-        if img_uri.startswith("data:"):
-            header, image_data = img_uri.split(",", 1)
-        else:
-            image_data = img_uri
-
-        # Decode the base64 string to bytes
-        image_bytes = base64.b64decode(image_data)
-
-        # Specify the target directory and file name
-        target_dir = "/home/hangxu/RVT"
         
-
-        file_path = os.path.join(target_dir, "output_image.jpg")
-
-        # Save the image bytes to a file
-        with open(file_path, "wb") as f:
-            f.write(image_bytes)
-
-        self.messages = [
+        self.prompt_messages = [
             {
                 "role": "user",
                 "content": [
@@ -99,21 +128,26 @@ class GSProcessor:
         ]
 
         response = self.client.chat.completions.create(
-            model=model_name,
-            messages=self.messages,
+            model=self.model_name,
+            messages=self.prompt_messages,
             temperature=0.0,
             max_tokens=300
         )
-        self.messages.append({
+        print("Detection step response:", response.choices[0].message.content)
+        print("Detection step response type:", type(response.choices[0].message.content))
+        self.prompt_messages.append({
             "role": "assistant",
             "content": response.choices[0].message.content
         })
-        print("Detection step response:", self.messages[-1]["content"])
+        # print("Detection step response:", self.prompt_messages[-1]["content"])
 
         # Refine object names to produce bounding box labels as a raw JSON array
-        self.messages.append({
+        self.prompt_messages.append({
             "role": "user",
-            "content": ("Next, I wish to generate bounding boxes for the objects you identified using the Grounding DINO model. "
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Next, I wish to generate bounding boxes for the objects you identified using the Grounding DINO model. "
                         "Please adjust the object names you just used as needed, so that they become suitable text prompts for the Grounding DINO model. Do not add or remove any objects. "
                         # "Please consider the following format: color + shape/size + object name. Please avoid using prepositions. "
                         "Please consider using adjectives that accurately describe the color, shape, size of the objects. "
@@ -121,52 +155,59 @@ class GSProcessor:
                         # "For articulated objects with multiple task related components, please just use a name that can be used to detect all components. Avoid complicated structural descriptions. "
                         # "If articulated objects have components with different colors, maybe consider omit the color part. "
                         "Again, you do not need to distinguish between objects that are identical. Simply repeat the same name. "
-                        "Please output the bounding box labels as a raw JSON array without any markdown formatting.")
+                        "Please output the bounding box labels as a raw JSON array without any markdown formatting."
+                }
+            ]
         })
 
         response = self.client.chat.completions.create(
-            model=model_name,
-            messages=self.messages,
+            model=self.model_name,
+            messages=self.prompt_messages,
             temperature=0.0,
             max_tokens=300
         )
-        self.messages.append({
+        self.prompt_messages.append({
             "role": "assistant",
             "content": response.choices[0].message.content
         })
         
         # Attempt to parse the bounding box labels as a JSON array.
         # dino_objects = self.get_valid_json("array")
-        print("Bounding box labels response:", self.messages[-1]["content"])
+        print("Bounding box labels response:", self.prompt_messages[-1]["content"])
 
 
 
         # Categorize the objects into manipulation objects, receiver objects, and other objects
-        self.messages.append({
+        self.prompt_messages.append({
             "role": "user",
-            "content": ("Please categorize the bounding box labels into three categories: manipulation objects (task-relevant objects that are directly manipulated or interacted with by the robot. "
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Please categorize the bounding box labels into three categories: manipulation objects (task-relevant objects that are directly manipulated or interacted with by the robot. "
                         "For instance, if the robot wants to hit a ball into a box with a stick, the stick is the manipulation object. Notice that all tasks must have at least one manipulation object), "
                         "receiver objects (task-relevant objects that are not directly interacted with by the robot. For instance, if the robot wants to hit a ball into a box with a stick, then ball and box are receiver objects. "
                         "Notice that not all tasks have receiver objects, such as tasks that only involve one object), and other objects (objects that are not manipulation or receiver objects and are irrelevant to the task. "
                         "Notice that not all scenes have other objects). "
                         "Please only output a raw JSON dictionary without any markdown formatting, with keys being \"mo\", \"ro\", and \"other\" and values being arrays of bounding box labels. "
-                        "The bounding box labels should be the same as the ones you used in the previous step. Do not change, add or remove any bounding box labels from the previous step.")
+                        "The bounding box labels should be the same as the ones you used in the previous step. Do not change, add or remove any bounding box labels from the previous step."
+                }
+            ]
         })
 
         response = self.client.chat.completions.create(
-            model=model_name,
-            messages=self.messages,
+            model=self.model_name,
+            messages=self.prompt_messages,
             temperature=0.0,
             max_tokens=300
         )
-        self.messages.append({
+        self.prompt_messages.append({
             "role": "assistant",
             "content": response.choices[0].message.content
         })
 
         # Attempt to parse the categorization as a JSON dictionary.
-        categories = self.get_valid_json("dict", model_name=model_name)
-        print("Categorization response:", self.messages[-1]["content"])
+        categories = self.get_valid_json("dict")
+        print("Categorization response:", self.prompt_messages[-1]["content"])
         # dino_objects.append("robot arm")
         categories["robot"] = ["robot arm"]
         dino_objects = categories.get("mo", []) + categories.get("ro", []) + categories.get("other", []) + ["robot arm"]
@@ -205,14 +246,15 @@ class GSProcessor:
         # These are ordered by descending confidence
         return input_boxes, confidences, dino_names
 
-    def _detect_objects(self, frame, object_counts, categories, detect_dir, b_t=0.1, t_t=0.1, threshold=0.5, model_name="gpt-4o"):
+    def _detect_objects(self, frame, task_description, object_counts, categories, detect_dir, b_t=0.1, t_t=0.1, threshold=0.5):
 
         
         img_np = np.array(frame)
         orig_img = img_np.copy()
         
         # cv2.imwrite(f"{detect_dir}/orig.png", cv2.cvtColor(orig_img, cv2.COLOR_RGB2BGR))
-        orig_img_uri = image_to_data_uri(orig_img)
+        orig_img_uri = image_to_data_uri(orig_img, convert=True)
+        save_uri(orig_img_uri, "detect_objects_orig.jpg")
         
         class_names = []
         total_input_boxes = []
@@ -257,12 +299,16 @@ class GSProcessor:
                 category_lookup[val] = cat_key
         print("category_lookup: ", category_lookup)
 
-        self.messages.append({
+        detect_msg_start = []
+
+        detect_msg_start.append({
             "role": "user",
             "content": [
                         {
                             "type": "text",
-                            "text": ("Now I have generated bounding boxes for individual objects that you have identified and the robot arm using Grounding DINO. "
+                            "text": (f"You are a robotic task assistant. You are given the following task: \"{task_description}\" and the initial observation of the task as an image. "
+                                    f"The key objects for this task include {set(category_lookup.keys())}. "
+                                    "For each object, I have generated a set of bounding boxes using the Grounding DINO model. "
                                     "For each object, I am going to give you an ordered list of bounding boxes visualized in the original image. "
                                     "You are going to inspect these images and select the most likely bounding boxes for the object. "
                                     "The number of bounding boxes you select should be the same as the number of objects, which I will give you. "
@@ -282,30 +328,36 @@ class GSProcessor:
         })
 
         response = self.client.chat.completions.create(
-            model=model_name,
-            messages=self.messages,
+            model=self.model_name,
+            messages=detect_msg_start,
             temperature=0.0,
             max_tokens=300
         )
-        self.messages.append({
+        detect_msg_start.append({
             "role": "assistant",
             "content": response.choices[0].message.content
         })
 
-        box_color = self.get_valid_json("array", model_name=model_name)
+        box_color, detect_msg_start_add = self.get_valid_json_detect("array", detect_msg_start)
+        detect_msg_start += detect_msg_start_add
         print("box_color: ", box_color)
+        detect_msg = detect_msg_start.copy()
 
         for i, (obj, count) in enumerate(object_counts.items()):
+            print("iter: ", i)
             box_images = []
             orig_idx = []
             # This loop extracts the bounding boxes that are not similar to any of the final bounding boxes
             # and draws them on the image. 
+            img_uri_list = []
             for j, box in enumerate(total_input_boxes[i]):
                 img_copy = img_np.copy()
                 print("total_confidences[i][j]: ", total_confidences[i][j])
                 
                 box_image = self.draw_box(img_copy, [box], box_color=box_color, padding=True)
-                cv2.imwrite(f"{detect_dir}/{''.join(ch for ch in obj if not ch.isspace())[:5]}_{i}_{j}.png", cv2.cvtColor(box_image, cv2.COLOR_RGB2BGR))
+                # cv2.imwrite(f"{detect_dir}/{''.join(ch for ch in obj if not ch.isspace())[:5]}_{i}_{j}.png", cv2.cvtColor(box_image, cv2.COLOR_RGB2BGR))
+                box_image_uri = image_to_data_uri(box_image, convert=True)
+                save_uri(box_image_uri, f"{detect_dir}/{''.join(ch for ch in obj if not ch.isspace())[:5]}_{i}_{j}.png")
                 similar, input_box, idx = self.get_iou(box, final_input_boxes)
                 if similar:
                     print(f"{obj}_{j} is similar to {final_input_boxes_aliases[idx]}")
@@ -319,37 +371,25 @@ class GSProcessor:
                     continue
                 else:
                     orig_idx.append(j)
-                    
-                    box_images.append(box_image)
+                    img_uri_list.append(box_image_uri)
+                    # box_images.append(box_image)
             orig_box_idx.append(orig_idx)
             
-            selected_boxes = []
+            # selected_boxes = []
             # for j in range(count):
                 
-
+            # img_uri_list = [image_to_data_uri(img, convert=True) for img in box_images]
+                
+            img_uri_list.append(orig_img_uri)
+            print("img_uri_list: ", len(img_uri_list) - 1)
+            
             # If the decisiveness is greater than threshold, then we select bounding boxes based on confidence levels.
             if sorted_decisiveness[i] > threshold:
                 selected_boxes = orig_idx[:count]
             else:
+                current_detect_msg = detect_msg_start.copy()
                 
-            
-                img_uri_list = [image_to_data_uri(img, convert=True) for img in box_images]
-                
-                img_uri_list.append(orig_img_uri)
-                print("img_uri_list: ", len(img_uri_list) - 1)
-
-                # for idx, uri in enumerate(img_uri_list):
-                #     # Assuming uri is your data URI string
-                #     header, encoded = uri.split(",", 1)
-                #     image_bytes = base64.b64decode(encoded)
-                #     image = Image.open(io.BytesIO(image_bytes))
-
-                #     # Save the image directly (e.g., as a JPEG file)
-                #     image.save(f"{detect_dir}/test_{obj}_{idx}.jpg")
-                
-
-                self.messages.append(
-                    {
+                detect_obj_msg = {
                         "role": "user",
                         "content": [
                             {
@@ -374,25 +414,33 @@ class GSProcessor:
                             for img_uri in img_uri_list
                         ]
                     }
-                )
+                
+                current_detect_msg.append(detect_obj_msg)
+                
+                detect_msg.append(detect_obj_msg)
+                
                 response = self.client.chat.completions.create(
-                    model=model_name,
-                    messages=self.messages,
+                    model=self.model_name,
+                    messages=current_detect_msg,
                     temperature=0.0,
                     max_tokens=300
                 )
-                self.messages.append({
+                response_json = {
                     "role": "assistant",
                     "content": response.choices[0].message.content
-                })
-
+                }
+                current_detect_msg.append(response_json)
+                detect_msg.append(response_json)
+                
                 
 
                 # Indices of the selected boxes (in a list with repetition removed)
-                selected_boxes_raw = self.get_valid_json("dict", model_name=model_name)["selected_index"]
+                selected_boxes_raw, current_detect_msg_add = self.get_valid_json_detect("dict", current_detect_msg)
+                detect_msg += current_detect_msg_add
+                selected_boxes_raw = selected_boxes_raw["selected_index"]
                 print("obj: ", obj)
                 # explanation = self.get_valid_json("dict")["explanation"]
-                print("Selection response:", self.messages[-1]["content"])
+                print("Selection response:", detect_msg[-1]["content"])
                 print("original indices: ", orig_idx)
                 print("selected indices: ", selected_boxes_raw)
                 selected_boxes = [orig_idx[j] for j in selected_boxes_raw]
@@ -448,7 +496,7 @@ class GSProcessor:
         cv2.imwrite(f"{detect_dir}/#final.png", cv2.cvtColor(final_vis, cv2.COLOR_RGB2BGR))        
             
         pprint.pprint(obj_log)
-        return final_input_boxes, type_names, obj_log
+        return final_input_boxes, type_names, obj_log, detect_msg
 
     def get_valid_json(self, expected_type, max_retries=3, model_name="gpt-4o"):
         """
@@ -458,7 +506,7 @@ class GSProcessor:
         """
         for attempt in range(max_retries):
             try:
-                content = self.messages[-1]["content"]
+                content = self.prompt_messages[-1]["content"]
                 print("content: ", content)
                 data = json.loads(content)
                 if expected_type == "array" and isinstance(data, list):
@@ -472,25 +520,71 @@ class GSProcessor:
                             "Please output only a raw JSON {} with no extra text or markdown formatting."
                         ).format("array" if expected_type=="array" else "dictionary",
                                     "array" if expected_type=="array" else "dictionary")
-            self.messages.append({
+            self.prompt_messages.append({
                 "role": "user",
                 "content": retry_prompt
             })
             response = self.client.chat.completions.create(
-                model=model_name,
-                messages=self.messages,
+                model=self.model_name,
+                messages=self.prompt_messages,
                 temperature=0.0,
                 max_tokens=300
             )
-            self.messages.append({
+            self.prompt_messages.append({
                 "role": "assistant",
                 "content": response.choices[0].message.content
             })
         raise ValueError("Unable to obtain a valid JSON {} after {} attempts.".format(
             "array" if expected_type=="array" else "dictionary", max_retries))
 
+    def get_valid_json_detect(self, expected_type, current_msg, max_retries=3):
+        """
+        Try to parse the most recent assistant message as JSON.
+        If parsing fails or the type is incorrect, prompt ChatGPT to re-send valid raw JSON.
+        expected_type: "array" or "dict"
+        """
+        add_msg = []
+        for attempt in range(max_retries):
+            try:
+                content = current_msg[-1]["content"]
+                print("content: ", content)
+                data = json.loads(content)
+                if expected_type == "array" and isinstance(data, list):
+                    return data, add_msg
+                elif expected_type == "dict" and isinstance(data, dict):
+                    return data, add_msg
+            except json.JSONDecodeError:
+                pass
+
+            retry_prompt = ("Your previous response was not a valid raw JSON {}. "
+                            "Please output only a raw JSON {} with no extra text or markdown formatting."
+                        ).format("array" if expected_type=="array" else "dictionary",
+                                    "array" if expected_type=="array" else "dictionary")
+            retry_msg = {
+                "role": "user",
+                "content": retry_prompt
+            }
+            current_msg.append(retry_msg)
+            add_msg.append(retry_msg)
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=current_msg,
+                temperature=0.0,
+                max_tokens=300
+            )
+            response_json = {
+                "role": "assistant",
+                "content": response.choices[0].message.content
+            }
+            current_msg.append(response_json)
+            add_msg.append(response_json)
+        raise ValueError("Unable to obtain a valid JSON {} after {} attempts.".format(
+            "array" if expected_type=="array" else "dictionary", max_retries))
+
     def _init_tracking(self, frame, class_names, input_boxes):
         """Initialize SAM tracking with first frame"""
+        # Ensure CUDA operations use the correct device when loading the first frame
+        torch.cuda.set_device(self.device)
         self.predictor.load_first_frame(np.array(frame))
         
         # The names are sorted by priority.
@@ -502,75 +596,99 @@ class GSProcessor:
             )
         return out_obj_ids, out_mask_logits
         
-    def process_frame(self, frame_idx, frames, task_description, log_dir):
+    def process_frame(self, step_idx, frames, task_description):
+        
         frames = frames.transpose(0,2,3,1)
         
-        if frame_idx == 0:
+        if step_idx == 0:
+            info = {}
+            info["TASK PROMPT"] = task_description
             if self.init:
                 self.predictor.reset_state()
 
-            
-            # First frame: Initialize tracking with Grounding DINO
-            image = Image.fromarray(frames[0])
-            # image = np.array(image)
-            dino_prompt, categories = self.get_detection_prompt(task_description, image)
-            object_counts = self.count_obj(dino_prompt)
-            detect_dir = os.path.join(log_dir, "detection", f"frame_{frame_idx}")
+            detect_dir = os.path.join(self.log_dir, f"detection_{self.detect_num}")
             if os.path.exists(detect_dir):
                 shutil.rmtree(detect_dir)
             os.makedirs(detect_dir, exist_ok=True)
-            input_boxes, class_names, detect_log = self._detect_objects(image, object_counts, categories, detect_dir, threshold=1, model_name="chatgpt-4o-latest")
+            # First frame: Initialize tracking with Grounding DINO
+            image = Image.fromarray(frames[0])
+            # image = np.array(image)
+            dino_prompt, categories = self.get_detection_prompt(task_description, image, detect_dir)
+            object_counts = self.count_obj(dino_prompt)
+            info["DINO PROMPT"] = dino_prompt
+            info["CATEGORIES"] = categories
+            info["OBJECT COUNTS"] = object_counts
+            
+            
+            input_boxes, class_names, detect_log, detect_msg = self._detect_objects(image, task_description, object_counts, categories, detect_dir, threshold=1)
+            self.detect_messages += detect_msg
+            
+            self.detect_num += 1
 
             print(class_names)
+            self.class_ids = reassign_labels(class_names)
             # Initialize SAM tracking
             out_obj_ids, out_mask_logits = self._init_tracking(image, class_names, input_boxes)
-        
+            self.write_logs(info, detect_log, detect_dir)
             
         else:
             # Subsequent frames: Track objects
             for frame in frames:
                 out_obj_ids, out_mask_logits = self.predictor.track(frame)
-        print(1111111111111111111)
-        print(out_obj_ids)
-        object_ids = out_obj_ids
-        print("segment ids origin", object_ids)
-        class_ids=np.array(object_ids, dtype=np.int32)
-        for i in range(len(class_ids)):
-            if class_ids[i] == 0:
-                class_ids[i] = 1
-            else:
-                class_ids[i] = 2
-        print("vis ids", class_ids)
-        masks = [ (out_mask_logits[i] > 0.0).cpu().numpy() for i in range(len(out_mask_logits))]
-        masks = np.concatenate(masks, axis=0)
-        
+
+        out_mask_logits = [(out_mask_logits[i] > 0.0).cpu().numpy() for i in range(len(out_mask_logits))]
+        out_mask_logits = np.concatenate(out_mask_logits, axis=0)
+        color_palette = sv.ColorPalette.from_hex(['808080', '#ff0000', '#00ff00', '#ffff00'])
+        background_color = [128, 128, 128]  # Grey in BGR
+        annotator = sv.MaskAnnotator(color=color_palette, opacity=1.0)
+        class_ids_arr = np.array(self.class_ids, dtype=np.int32)
+        sort_idx = np.argsort(class_ids_arr)
+        sorted_masks = out_mask_logits[sort_idx]
+        sorted_class_ids = class_ids_arr[sort_idx]
+
         detections = sv.Detections(
-            xyxy=sv.mask_to_xyxy(masks),  # (n, 4)
-            mask=masks, # (n, h, w)
-            class_id=class_ids,
+            xyxy=sv.mask_to_xyxy(sorted_masks),
+            mask=sorted_masks,
+            class_id=sorted_class_ids
         )
-        mask_annotator = sv.MaskAnnotator(opacity=1.0)
+        
         # Convert RGB to BGR for OpenCV
         frame_bgr = cv2.cvtColor(frames[-1], cv2.COLOR_RGB2BGR)
-        annotated_frame = mask_annotator.annotate(scene=frame_bgr.copy(), detections=detections)
+        annotated_frame = annotator.annotate(scene=frame_bgr.copy(), detections=detections)
+        union_mask = np.any(sorted_masks, axis=0)
+        colored_background = np.full_like(annotated_frame, background_color)
+        final_frame = np.where(union_mask[..., None], annotated_frame, colored_background)
+
+
+        # print(1111111111111111111)
+        # print(out_obj_ids)
+        # object_ids = out_obj_ids
+        # print("segment ids origin", object_ids)
+        # class_ids = np.array(object_ids, dtype=np.int32)
+        # for i in range(len(class_ids)):
+        #     if class_ids[i] == 0:
+        #         class_ids[i] = 1
+        #     else:
+        #         class_ids[i] = 2
+        # print("vis ids", class_ids)
+        # masks = [ (out_mask_logits[i] > 0.0).cpu().numpy() for i in range(len(out_mask_logits))]
+        # masks = np.concatenate(masks, axis=0)
+        
+        # detections = sv.Detections(
+        #     xyxy=sv.mask_to_xyxy(masks),  # (n, 4)
+        #     mask=masks, # (n, h, w)
+        #     class_id=class_ids,
+        # )
+        # mask_annotator = sv.MaskAnnotator(opacity=1.0)
+        # # Convert RGB to BGR for OpenCV
+        # frame_bgr = cv2.cvtColor(frames[-1], cv2.COLOR_RGB2BGR)
+        # annotated_frame = mask_annotator.annotate(scene=frame_bgr.copy(), detections=detections)
         # cv2.imwrite(os.path.join("./tracking_results", f"annotated_frame_{frame_idx:05d}_origin.jpg"), frame_bgr)
         # cv2.imwrite(os.path.join("./tracking_results", f"annotated_frame_{frame_idx:05d}.jpg"), annotated_frame)
 
-        return annotated_frame
+        return final_frame
 
-    def _reassign_labels(self, class_names):
-        """Create consistent integer labels for object types"""
-        labels = []
-        for i in class_names:
-            if i == "robot":
-                labels.append(1)
-            elif i == "mo":
-                labels.append(2)
-            elif i == "ro":
-                labels.append(3)
-            else:
-                labels.append(0)
-        return labels
+    
         
     # def close(self):
     #     self.socket.send_json({"command": "exit"})
@@ -716,6 +834,41 @@ class GSProcessor:
 
         # Compare with threshold
         return iou
+
+    def write_logs(self, info, detect_logs, detect_dir):
+        with open(os.path.join(detect_dir, "#seg_log.txt"), "w", encoding="utf-8") as f:
+            f.write("####################### INFO #######################\n")
+            for i, j in info.items():
+                f.write(f"{i}: {j}\n")
+            f.write("\n")
+            f.write("####################### DETECT LOG #######################\n")
+            for i, detect_log in enumerate(detect_logs):
+                f.write(f"Detection {i+1}:\n")
+                # for j, k in detect_log.items():
+                #     f.write(f"{j}: {k}\n")
+                pprint.pprint(detect_log, stream=f, indent=2)
+                f.write("\n")
+            f.write("\n")
+            f.write("####################### GPT PROMPT LOG #######################\n")
+            for i in self.prompt_messages:
+                role = i["role"]
+                content = i["content"]
+                if type(content) == list:
+                    for j in content:
+                        if j["type"] == "text":
+                            f.write(f"{role}: {j['text']}\n")
+                else:
+                    f.write(f"{role}: {content}\n")
+            f.write("####################### GPT DETECT LOG #######################\n")
+            for i in self.detect_messages:
+                role = i["role"]
+                content = i["content"]
+                if type(content) == list:
+                    for j in content:
+                        if j["type"] == "text":
+                            f.write(f"{role}: {j['text']}\n")
+                else:
+                    f.write(f"{role}: {content}\n")
 
 def image_to_data_uri(image, convert=False):
     """

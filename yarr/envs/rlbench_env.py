@@ -330,6 +330,7 @@ class MultiTaskRLBenchEnv(MultiTaskEnv):
         else:
             env_cfg = None
 
+    
         self._rlbench_env = EnvironmentExt(
             action_mode=self._action_mode, obs_config=self._observation_config, 
             path_task_ttms=TASKS_TTM_FOLDER,
@@ -338,7 +339,10 @@ class MultiTaskRLBenchEnv(MultiTaskEnv):
 
         self._rlbench_env.launch()
         self._set_new_task()
-
+        
+        # descriptions, _ = self._task.reset()
+        # (demo,) = self._task.get_demos(amount=1, live_demos=True)
+        
     def shutdown(self):
         self._rlbench_env.shutdown()
 
